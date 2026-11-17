@@ -15,8 +15,7 @@
 // this file only runs the lifecycle. Node standard library only — no
 // dependencies, no git binary, no network beyond the env.
 
-import { createApp } from "./app.ts";
-import type { Server } from "node:http";
+import { createApp, type ForgeServer } from "./app.ts";
 
 const ENV_VAR = "MAKEFUN_ENV_URL";
 const REGISTER_PATH = "/register";
@@ -56,7 +55,7 @@ async function getJson(url: string): Promise<Record<string, unknown> | null> {
 }
 
 /** Bind `server` to an ephemeral port and return the port the kernel picked. */
-async function bindEphemeral(server: Server): Promise<number> {
+async function bindEphemeral(server: ForgeServer): Promise<number> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, () => {
