@@ -20,7 +20,7 @@ import { handleGit } from './src/git.ts';
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   const store = new Store();
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const path = pathOf(req);
@@ -76,4 +76,12 @@ export function createApp(): Server {
       }
     })();
   });
+  // S0: longer keep-alive (30 s, was Node's 5 s default) so the 50 concurrent clone
+  // sockets are not torn down and rebuilt between rounds; explicit TCP_NODELAY so small
+  // responses are not held for Nagle coalescing.
+  server.keepAliveTimeout = 30000;
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+  return server;
 }

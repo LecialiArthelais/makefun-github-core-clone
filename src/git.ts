@@ -68,6 +68,29 @@ function cachedFetch(
   return built;
 }
 
+/**
+ * A fingerprint of a repo's refs: `defaultBranch` + every `name=oid` pair, sorted.
+ * It covers everything listRefs()/wanted-refs depend on — a tag's peeled target is a pure
+ * function of the tag object's content, which its oid already fixes. Used as a cache key
+ * so a ref mutation can never serve a stale cached advertisement/ls-refs/fetch response,
+ * even on a path that does not bump `generation` (#1).
+ */
+function refsFingerprint(repo: Repo): string {
+  const parts: string[] = [repo.defaultBranch];
+  for (const name of [...repo.refs.keys()].sort()) parts.push(`${name}=${repo.refs.get(name)}`);
+  return parts.join('\n');
+}
+
+/** Cached ls-refs response bodies, per repo, keyed by refs fingerprint + request flags (#1). */
+const lsRefsCache = new WeakMap<Repo, Map<string, Buffer>>();
+const LS_REFS_CACHE_MAX = 16;
+
+/** Cached fully-framed v2 fetch responses, per repo (#1). The key covers every input the
+ * response depends on: the fetch parameters (wants/haves/depth/shallow) via fetchCacheKey,
+ * plus the refs fingerprint (wanted-refs). Valid only at the generation it was built at. */
+const fetchResponseCache = new WeakMap<Repo, Map<string, { generation: number; body: Buffer }>>();
+const FETCH_RESPONSE_CACHE_MAX = 8;
+
 /** Build a pack from a collected object set (sorted by oid, so the bytes are deterministic). */
 function buildPack(objects: Map<string, { type: ObjectType; data: Buffer }>): Buffer | null {
   if (objects.size === 0) return null;
@@ -145,27 +168,40 @@ function v2Advertisement(): Buffer {
   return encodePktLines(lines);
 }
 
-/** The v0 advertisement body for git-receive-pack. */
+/**
+ * The v2 advertisement bytes are constant (fixed capability list, fixed agent string),
+ * so build them once at module load instead of re-encoding them per info/refs request (#1).
+ */
+const V2_ADVERTISEMENT = v2Advertisement();
+
+/** Frame one pkt-line as text (4-hex length prefix + line); byte-exact with pktText. */
+function frameText(line: string): string {
+  const n = Buffer.byteLength(line) + 4;
+  return n.toString(16).padStart(4, '0') + line;
+}
+
+/** The v0 advertisement body for git-receive-pack. Built as one string + one Buffer.from
+ * instead of one Buffer per line + concat (#3; only the tip oid varies per repo state).
+ * Logic (including the index-0 caps rule) is verbatim from the old construction. */
 function v0Advertisement(repo: Repo): Buffer {
   const caps = `symref=HEAD:refs/heads/${repo.defaultBranch} report-status side-band-64k delete-refs ofs-delta object-format=sha1 agent=${AGENT}`;
   const refs = listRefs(repo);
-  const parts: Buffer[] = [pktText('# service=git-receive-pack\n'), PKT_FLUSH];
+  let s = frameText('# service=git-receive-pack\n') + '0000';
   const hasRefs = refs.some((r) => !r.unborn);
   if (!hasRefs) {
-    parts.push(pktText(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-    parts.push(PKT_FLUSH);
-    return Buffer.concat(parts);
+    s += frameText(`${ZERO_OID} capabilities^{}\0${caps}\n`) + '0000';
+    return Buffer.from(s, 'utf8');
   }
   refs.forEach((ref, index) => {
     if (ref.unborn) return;
     const suffix = index === 0 ? `\0${caps}` : '';
-    parts.push(pktText(`${ref.oid} ${ref.name}${suffix}\n`));
+    s += frameText(`${ref.oid} ${ref.name}${suffix}\n`);
     if (ref.peeled !== undefined) {
-      parts.push(pktText(`${ref.peeled} ${ref.name}^{}\n`));
+      s += frameText(`${ref.peeled} ${ref.name}^{}\n`);
     }
   });
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  s += '0000';
+  return Buffer.from(s, 'utf8');
 }
 
 // ------------------------------------------------------------------ object collection
@@ -228,12 +264,14 @@ function collectObjects(repo: Repo, tips: string[], haves: string[], depth?: num
     }
   };
 
-  // BFS over commits with depth tracking (depth 0 = the tips).
+  // BFS over commits with depth tracking (depth 0 = the tips). Index pointer, not
+  // shift() (S2): same FIFO order, no O(n) re-indexing per pop.
   const queue: { oid: string; depth: number }[] = [];
   for (const tip of tips) queue.push({ oid: tip, depth: 0 });
   const seenCommits = new Set<string>();
-  while (queue.length > 0) {
-    const { oid, depth: d } = queue.shift() as { oid: string; depth: number };
+  let qi = 0;
+  while (qi < queue.length) {
+    const { oid, depth: d } = queue[qi++] as { oid: string; depth: number };
     if (seenCommits.has(oid)) continue;
     seenCommits.add(oid);
     const obj = repo.objects.get(oid);
@@ -306,6 +344,14 @@ function handleLsRefs(repo: Repo, lines: string[]): Buffer {
     else if (t.startsWith('ref-prefix ')) req.prefixes.push(t.slice('ref-prefix '.length));
     // agent= / object-format= are accepted and ignored.
   }
+  const key = `${refsFingerprint(repo)}|${req.peel ? 1 : 0}${req.symrefs ? 1 : 0}${req.unborn ? 1 : 0}|${req.prefixes.join(',')}`;
+  let perRepo = lsRefsCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    lsRefsCache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(key);
+  if (hit !== undefined) return hit;
   const refs = listRefs(repo);
   const out: Buffer[] = [];
   for (const ref of refs) {
@@ -319,7 +365,13 @@ function handleLsRefs(repo: Repo, lines: string[]): Buffer {
     out.push(pktText(line));
   }
   out.push(PKT_FLUSH);
-  return Buffer.concat(out);
+  const body = Buffer.concat(out);
+  if (perRepo.size >= LS_REFS_CACHE_MAX) {
+    const first = perRepo.keys().next().value as string | undefined;
+    if (first !== undefined) perRepo.delete(first);
+  }
+  perRepo.set(key, body);
+  return body;
 }
 
 interface FetchRequest {
@@ -360,6 +412,28 @@ function handleFetchV2(repo: Repo, req: FetchRequest): Buffer {
     return Buffer.concat([pktText('acknowledgments\n'), pktText('NAK\n'), PKT_DELIM, PKT_FLUSH]);
   }
 
+  // The full response is a pure function of the fetch parameters + the refs, so cache
+  // the fully-framed bytes (#1). Error/empty paths above bypass the cache on purpose:
+  // an unknown want may exist after a later push.
+  const key = `${fetchCacheKey(req.wants, req.haves, req.depth, req.shallowSent)}|${refsFingerprint(repo)}`;
+  let perRepo = fetchResponseCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    fetchResponseCache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(key);
+  if (hit !== undefined && hit.generation === repo.generation) return hit.body;
+  const body = buildFetchV2Response(repo, req);
+  if (perRepo.size >= FETCH_RESPONSE_CACHE_MAX) {
+    const first = perRepo.keys().next().value as string | undefined;
+    if (first !== undefined) perRepo.delete(first);
+  }
+  perRepo.set(key, { generation: repo.generation, body });
+  return body;
+}
+
+/** Build the v2 fetch response body (acknowledgments + shallow-info + wanted-refs + packfile). */
+function buildFetchV2Response(repo: Repo, req: FetchRequest): Buffer {
   const { pack, shallow } = cachedFetch(repo, req.wants, req.haves, req.depth, req.shallowSent, () => {
     const collected = collectObjects(repo, req.wants, req.haves, req.depth, req.shallowSent);
     return { pack: buildPack(collected.objects), shallow: collected.shallow };
@@ -568,14 +642,23 @@ async function handleReceivePack(repo: Repo, body: Buffer): Promise<Buffer> {
   }
   if (mutated) repo.generation += 1;
 
+  // Frame the report-status body into one pre-sized buffer (#3): one alloc instead of
+  // a Buffer.concat per sideband chunk. Bytes are identical to the old construction.
   const reportBytes = encodePktLines(report);
-  const parts: Buffer[] = [];
+  const chunkCount = Math.ceil(reportBytes.length / 65515);
+  const out = Buffer.allocUnsafe(reportBytes.length + chunkCount * 5 + 4);
+  let o = 0;
   for (let i = 0; i < reportBytes.length; i += 65515) {
-    const slice = reportBytes.subarray(i, Math.min(reportBytes.length, i + 65515));
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+    const sliceLen = Math.min(65515, reportBytes.length - i);
+    const len = sliceLen + 1 + 4;
+    out.write(len.toString(16).padStart(4, '0'), o, 4, 'ascii');
+    o += 4;
+    out[o++] = 1;
+    reportBytes.copy(out, o, i, i + sliceLen);
+    o += sliceLen;
   }
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  out.write('0000', o, 4, 'ascii');
+  return out;
 }
 
 // ------------------------------------------------------------------ router
@@ -608,7 +691,7 @@ export async function handleGit(store: Store, req: IncomingMessage, res: ServerR
   if (tail.length === 2 && tail[0] === 'info' && tail[1] === 'refs' && method === 'GET') {
     const service = query.get('service');
     if (service === 'git-upload-pack') {
-      sendBytes(res, 200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
+      sendBytes(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
       return true;
     }
     if (service === 'git-receive-pack') {

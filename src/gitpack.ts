@@ -11,7 +11,7 @@
 // - delta format: source-size varint, target-size varint, then copy (0x80 set) / insert ops.
 
 import { createHash } from 'node:crypto';
-import { deflateSync, createInflate } from 'node:zlib';
+import { deflateSync, createInflate, inflateSync } from 'node:zlib';
 import { objectId, type ObjectType } from './store.ts';
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
@@ -209,6 +209,25 @@ function inflateOne(buf: Buffer, start: number): Promise<{ data: Buffer; end: nu
   });
 }
 
+/**
+ * Inflate one zlib stream synchronously, starting at `start`. Only for small packs (#3):
+ * the streaming Inflate costs ~195 µs per object (setup + event-loop turns) vs ~43 µs
+ * sync for the bench pack. Semantics match the streaming path exactly — same zlib
+ * inflate, trailing bytes after the stream are ignored, `engine.bytesWritten` is the
+ * stream's end — verified against the streaming path (truncated/corrupt inputs throw
+ * the same errors on both; see perf-phase2/inflate-test.mjs).
+ */
+const SYNC_INFLATE_MAX_PACK_BYTES = 64 * 1024;
+function inflateOneSync(buf: Buffer, start: number): { data: Buffer; end: number } {
+  const result = inflateSync(buf.subarray(start), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
+  };
+  const written = result.engine.bytesWritten;
+  if (!written || written <= 0) throw new Error('zlib stream consumed no bytes');
+  return { data: result.buffer, end: start + written };
+}
+
 export interface PackReadResult {
   objects: Map<string, { type: ObjectType; data: Buffer }>;
   deltaCount: number;
@@ -263,7 +282,10 @@ export async function readPack(pack: Buffer, resolveBase?: (oid: string) => { ty
       baseOid = pack.subarray(i, i + 20).toString('hex');
       i += 20;
     }
-    const { data, end } = await inflateOne(pack, i);
+    // Small packs take the sync path (bench pack: 586 B); large packs keep streaming
+    // (the 600-object history push stays on the streaming path by design).
+    const { data, end } =
+      pack.length < SYNC_INFLATE_MAX_PACK_BYTES ? inflateOneSync(pack, i) : await inflateOne(pack, i);
     if (data.length !== size) throw new Error(`pack object size mismatch: header ${size}, inflated ${data.length}`);
     raw.push({ typeCode, offset, baseOffset, baseOid, data, size });
     i = end;
@@ -284,6 +306,10 @@ export async function readPack(pack: Buffer, resolveBase?: (oid: string) => { ty
     if (type === undefined) throw new Error(`unknown pack object type ${entry.typeCode}`);
     storeResolved(entry, { type, data: entry.data });
   }
+  // O(1) OFS-delta base lookup (S3): the old `raw.find()` per delta is linear in the
+  // pack size; the bench has no deltas, but delta-pack checks do.
+  const rawByOffset = new Map<number, (typeof raw)[number]>();
+  for (const entry of raw) rawByOffset.set(entry.offset, entry);
   const resolve = (entry: (typeof raw)[number]): { type: ObjectType; data: Buffer } => {
     const cached = byOffset.get(entry.offset);
     if (cached !== undefined) return cached;
@@ -293,7 +319,7 @@ export async function readPack(pack: Buffer, resolveBase?: (oid: string) => { ty
     deltaCount += 1;
     let base: { type: ObjectType; data: Buffer } | undefined;
     if (entry.typeCode === 6) {
-      const baseEntry = raw.find((e) => e.offset === entry.baseOffset);
+      const baseEntry = rawByOffset.get(entry.baseOffset as number);
       if (baseEntry !== undefined) base = resolve(baseEntry);
     } else {
       base = byOid.get(entry.baseOid as string);

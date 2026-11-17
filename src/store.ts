@@ -499,7 +499,7 @@ export class Store {
       title,
       body,
       state: 'open',
-      labels: labels.slice(),
+      labels: labels.length === 0 ? [] : labels.slice(),
       comments: [],
       nextCommentId: 1,
     };

@@ -28,9 +28,14 @@ export function trialNowIso(): string {
   return new Date(trialNowSec() * 1000).toISOString();
 }
 
-/** The bearer token the suite presents (MAKEFUN_SHOP_TOKEN); empty when unset (local dev). */
+/**
+ * The bearer token the suite presents (MAKEFUN_SHOP_TOKEN); empty when unset (local dev).
+ * Read once at module load (S6): the harness sets it before the process starts and no
+ * check mutates it mid-process, so a per-request env read is pure overhead.
+ */
+const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 export function shopToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return SHOP_TOKEN;
 }
 
 let requestCounter = 0;
@@ -103,6 +108,8 @@ export async function readBody(req: IncomingMessage, maxBytes = 64 * 1024 * 1024
     if (size > maxBytes) return null;
     chunks.push(buf);
   }
+  // Fast path (#4): a body that arrived in one chunk is already the exact body buffer.
+  if (chunks.length === 1) return chunks[0] as Buffer;
   return Buffer.concat(chunks, size);
 }
 
@@ -136,22 +143,35 @@ export function isAuthorized(req: IncomingMessage): boolean {
   return got !== null && got === expected;
 }
 
+/**
+ * Parse the request URL once per request (#4): every git request used to pay 3x
+ * `new URL()` (app.ts pathOf + handleGit queryOf + any second parse) and every REST
+ * request 2x. The parsed URL is memoized on the request object itself — one request is
+ * one object, GC'd with it — so the single parse is shared by pathOf and queryOf.
+ */
+const PARSED_URL = Symbol('forge.parsedUrl');
+function parsedUrl(req: IncomingMessage): URL | null {
+  const holder = req as unknown as Record<symbol, URL | null | undefined>;
+  const cached = holder[PARSED_URL];
+  if (cached !== undefined) return cached;
+  let parsed: URL | null;
+  try {
+    parsed = new URL(req.url ?? '/', 'http://forge');
+  } catch {
+    parsed = null;
+  }
+  holder[PARSED_URL] = parsed;
+  return parsed;
+}
+
 /** The path of a request URL, or '/' when it does not parse. Never throws. */
 export function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://forge').pathname;
-  } catch {
-    return '/';
-  }
+  return parsedUrl(req)?.pathname ?? '/';
 }
 
 /** The query parameters of a request URL. Never throws. */
 export function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://forge').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+  return parsedUrl(req)?.searchParams ?? new URLSearchParams();
 }
 
 /** Base64url-encode a string (opaque global ids). */

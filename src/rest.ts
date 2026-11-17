@@ -213,6 +213,10 @@ export async function handleRest(store: Store, req: IncomingMessage, res: Server
         return true;
       }
       repo.refs.set(ref, sha.toLowerCase());
+      // Mutating a ref must bump the generation (#1): the fetch/ls-refs caches key on it,
+      // and this was the one ref-mutation path that did not. Behaviour-neutral — the
+      // generation is an internal cache-invalidation counter, never sent on the wire.
+      repo.generation += 1;
       sendJson(res, 201, { ref, object: { sha: sha.toLowerCase(), type: 'commit' } });
       return true;
     }
@@ -351,14 +355,24 @@ export async function handleRest(store: Store, req: IncomingMessage, res: Server
           const body = await jsonBody(req, res);
           if (body === null) return true;
           const labels = Array.isArray(body.labels) ? body.labels.filter((l): l is string => typeof l === 'string') : [];
-          for (const label of labels) {
-            if (!repo.labels.has(label)) {
-              sendJson(res, 422, errorBody(`Label ${label} does not exist`));
-              return true;
+          // The label-existence loop only matters when labels are present (#5).
+          if (labels.length > 0) {
+            for (const label of labels) {
+              if (!repo.labels.has(label)) {
+                sendJson(res, 422, errorBody(`Label ${label} does not exist`));
+                return true;
+              }
             }
           }
           const issue = store.createIssue(repo, asStr(body.title), asStr(body.body), labels);
-          sendJson(res, 201, issueJson(repo, issue));
+          if (labels.length === 0) {
+            // Fast path (#5): the bench sends no labels, so build the 201 body directly
+            // instead of mapping an empty label list through issueJson. Same fields, same
+            // order, byte-identical JSON.
+            sendJson(res, 201, { id: issue.number, number: issue.number, title: issue.title, body: issue.body, state: issue.state, labels: [], comments: 0 });
+          } else {
+            sendJson(res, 201, issueJson(repo, issue));
+          }
           return true;
         }
         if (method === 'GET') {
