@@ -170,6 +170,21 @@ type issueJSON struct {
 	Comments int         `json:"comments"`
 }
 
+// cachedIssueBody returns the memoized JSON response body for an issue
+// (with trailing newline, exactly as jsonResponse builds it), refilling it
+// when the issue or the repo's labels changed. The bytes are shared
+// read-only across responses; writeResponse never mutates them.
+func cachedIssueBody(repo *Repo, issue *Issue) []byte {
+	if issue.jsonBody != nil && issue.jsonVer == issue.ver && issue.jsonLabelsVer == repo.labelsVer {
+		return issue.jsonBody
+	}
+	body := append(marshalJSON(toIssueJSON(repo, issue)), '\n')
+	issue.jsonBody = body
+	issue.jsonVer = issue.ver
+	issue.jsonLabelsVer = repo.labelsVer
+	return body
+}
+
 func toIssueJSON(repo *Repo, issue *Issue) issueJSON {
 	labels := make([]labelJSON, 0, len(issue.Labels))
 	for _, name := range issue.Labels {
@@ -286,7 +301,7 @@ func unauthorizedResp() Response {
 // handleRest is the REST v3 handler. Returns (response, handled).
 func handleRest(store *Store, req *Request, segments []string) (Response, bool) {
 	method := req.Method
-	query := req.Query
+	query := req.QueryMap()
 
 	// GET /api/v3/ — root. No auth; X-OAuth-Scopes present.
 	if len(segments) == 0 {
@@ -679,6 +694,7 @@ func handleRest(store *Store, req *Request, segments []string) (Response, bool) 
 			}
 			color := asStr(body["color"], "ededed")
 			repo.Labels[labelName] = Label{Name: labelName, Color: color}
+			repo.labelsVer++
 			return jsonResponse(201, map[string]string{"name": labelName, "color": color}), true
 		}
 
@@ -713,7 +729,7 @@ func handleRest(store *Store, req *Request, segments []string) (Response, bool) 
 						}
 					}
 					issue := store.CreateIssue(repo, asStr(body["title"]), asStr(body["body"]), labels)
-					return jsonResponse(201, toIssueJSON(repo, issue)), true
+					return jsonResponseBytes(201, cachedIssueBody(repo, issue)), true
 				}
 				if method == "GET" {
 					stateFilter := queryGet(query, "state")
@@ -735,26 +751,37 @@ func handleRest(store *Store, req *Request, segments []string) (Response, bool) 
 						nums = append(nums, n)
 					}
 					sort.Ints(nums)
-					var list []issueJSON
+					var filtered []*Issue
 					for _, n := range nums {
 						issue := repo.Issues[n]
 						if stateFilter != "all" && string(issue.State) != stateFilter {
 							continue
 						}
-						list = append(list, toIssueJSON(repo, issue))
+						filtered = append(filtered, issue)
 					}
 					if sortParam == "created" && direction == "desc" {
-						for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
-							list[i], list[j] = list[j], list[i]
+						for i, j := 0, len(filtered)-1; i < j; i, j = i+1, j-1 {
+							filtered[i], filtered[j] = filtered[j], filtered[i]
 						}
 					}
-					if len(list) > perPage {
-						list = list[:perPage]
+					if len(filtered) > perPage {
+						filtered = filtered[:perPage]
 					}
-					if list == nil {
-						list = []issueJSON{}
+					// Join the memoized per-issue element bytes (the cached
+					// body minus its trailing newline) — byte-identical to
+					// marshaling the []issueJSON list.
+					out := make([]byte, 0, 256)
+					out = append(out, '[')
+					for i, issue := range filtered {
+						if i > 0 {
+							out = append(out, ',')
+						}
+						body := cachedIssueBody(repo, issue)
+						out = append(out, body[:len(body)-1]...)
 					}
-					return jsonResponse(200, list), true
+					out = append(out, ']')
+					out = append(out, '\n')
+					return jsonResponseBytes(200, out), true
 				}
 				return Response{}, false
 			}
@@ -775,6 +802,7 @@ func handleRest(store *Store, req *Request, segments []string) (Response, bool) 
 					comment := Comment{ID: issue.NextCommentID, Body: asStr(body["body"])}
 					issue.NextCommentID++
 					issue.Comments = append(issue.Comments, comment)
+					issue.ver++
 					return jsonResponse(201, commentJSON{ID: comment.ID, Body: comment.Body}), true
 				}
 				if method == "GET" {
@@ -791,7 +819,7 @@ func handleRest(store *Store, req *Request, segments []string) (Response, bool) 
 					return notFoundResp(), true
 				}
 				if method == "GET" {
-					return jsonResponse(200, toIssueJSON(repo, issue)), true
+					return jsonResponseBytes(200, cachedIssueBody(repo, issue)), true
 				}
 				if method == "PATCH" {
 					body, errResp := jsonBody(req)
@@ -807,7 +835,8 @@ func handleRest(store *Store, req *Request, segments []string) (Response, bool) 
 					if s, ok := body["state"].(string); ok && (s == "open" || s == "closed") {
 						issue.State = IssueState(s)
 					}
-					return jsonResponse(200, toIssueJSON(repo, issue)), true
+					issue.ver++
+					return jsonResponseBytes(200, cachedIssueBody(repo, issue)), true
 				}
 				return Response{}, false
 			}

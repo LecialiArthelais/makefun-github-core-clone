@@ -63,6 +63,15 @@ type Issue struct {
 	Labels        []string
 	Comments      []Comment
 	NextCommentID int
+	// ver bumps on every mutation of this issue (PATCH, comment add, close).
+	// jsonBody is the memoized JSON response body for this issue (with the
+	// trailing newline jsonResponse appends), valid while jsonVer == ver and
+	// jsonLabelsVer == the repo's labelsVer. Same generation-keyed pattern
+	// as the git caches; a stale entry can never be served.
+	ver           int
+	jsonBody      []byte
+	jsonVer       int
+	jsonLabelsVer int
 }
 
 type PullFile struct {
@@ -111,6 +120,9 @@ type Repo struct {
 	Pulls     map[int]*Pull
 	NextIssue int
 	NextPull  int
+	// labelsVer bumps whenever a label is created; the memoized issue JSON
+	// keys on it (label colors feed into the issue body).
+	labelsVer int
 	// Creation order, for stable list ordering.
 	Seq int
 	// Bumped on every object/ref mutation; the git pack cache keys on it.
@@ -119,6 +131,15 @@ type Repo struct {
 	packCache map[string]*fetchCacheEntry
 	lsCache   map[string][]byte
 	respCache map[string]*respCacheEntry
+	// Memoized refs-derived bytes, keyed by Generation (which already bumps
+	// on every refs mutation — the same invalidation signal the git caches
+	// rely on). -1 = not built yet.
+	v0Adv          []byte
+	v0AdvGen       int
+	fp             string
+	fpGen          int
+	sortedNames    []string
+	sortedNamesGen int
 }
 
 type fetchCacheEntry struct {
@@ -596,8 +617,19 @@ func NewStore() *Store {
 func (s *Store) Lock()   { s.mu.Lock() }
 func (s *Store) Unlock() { s.mu.Unlock() }
 
+// lowerOrSame lowercases s, but returns s itself (no allocation) when it
+// contains no byte that lowercasing would change.
+func lowerOrSame(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' || s[i] >= 0x80 {
+			return strings.ToLower(s)
+		}
+	}
+	return s
+}
+
 func (s *Store) repoKey(owner, name string) string {
-	return strings.ToLower(owner) + "/" + strings.ToLower(name)
+	return lowerOrSame(owner) + "/" + lowerOrSame(name)
 }
 
 func (s *Store) GetRepo(owner, name string) *Repo {
@@ -616,23 +648,26 @@ func (s *Store) CreateRepo(name, description string, isPrivate bool) *Repo {
 		return nil
 	}
 	repo := &Repo{
-		DatabaseID:    s.nextDatabaseID,
-		Name:          name,
-		Owner:         ViewerLogin,
-		Description:   description,
-		Private:       isPrivate,
-		DefaultBranch: DefaultBranch,
-		Refs:          map[string]string{},
-		Objects:       map[string]GitObject{},
-		Labels:        map[string]Label{},
-		Issues:        map[int]*Issue{},
-		Pulls:         map[int]*Pull{},
-		NextIssue:     1,
-		NextPull:      1,
-		Seq:           s.nextSeq,
-		packCache:     map[string]*fetchCacheEntry{},
-		lsCache:       map[string][]byte{},
-		respCache:     map[string]*respCacheEntry{},
+		DatabaseID:     s.nextDatabaseID,
+		Name:           name,
+		Owner:          ViewerLogin,
+		Description:    description,
+		Private:        isPrivate,
+		DefaultBranch:  DefaultBranch,
+		Refs:           map[string]string{},
+		Objects:        map[string]GitObject{},
+		Labels:         map[string]Label{},
+		Issues:         map[int]*Issue{},
+		Pulls:          map[int]*Pull{},
+		NextIssue:      1,
+		NextPull:       1,
+		Seq:            s.nextSeq,
+		packCache:      map[string]*fetchCacheEntry{},
+		lsCache:        map[string][]byte{},
+		respCache:      map[string]*respCacheEntry{},
+		v0AdvGen:       -1,
+		fpGen:          -1,
+		sortedNamesGen: -1,
 	}
 	s.nextDatabaseID++
 	s.nextSeq++
