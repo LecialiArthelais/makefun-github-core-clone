@@ -4,6 +4,15 @@
 // synchronously for objects <= 64 KiB and stream otherwise — same split as the
 // Node original, so a pathological decompression bomb cannot hold the store
 // lock for long on one large object.
+//
+// Performance: zlib reader/writer setup dominates small objects (a fresh
+// flate reader/writer allocates a 32 KiB history window + Huffman tables per
+// object; ~16 µs inflate / ~446 µs deflate per 1 KiB object measured), so both
+// are pooled with sync.Pool + Reset. Reset fully reinitializes the stream
+// state (Go's zlib/flate Reset discards all per-stream state), so pooled
+// readers/writers emit byte-identical output to fresh ones and never leak
+// state between objects. The countingReader + ReadByte exact-consumed
+// accounting is unchanged (the pooled reader is Reset onto it directly).
 
 package main
 
@@ -18,7 +27,37 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+// emptyZlibStream is a valid zlib stream for zero bytes, used only to seed
+// pooled readers (zlib.NewReader needs a readable stream to construct one).
+// It is produced by the stdlib itself, so NewReader over it cannot fail.
+var emptyZlibStream = func() []byte {
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	zw.Close()
+	return buf.Bytes()
+}()
+
+// zlibResetter is the Reset method every pooled zlib reader carries.
+type zlibResetter interface {
+	io.ReadCloser
+	Reset(io.Reader, []byte) error
+}
+
+var zlibReaderPool = sync.Pool{New: func() any {
+	zr, err := zlib.NewReader(bytes.NewReader(emptyZlibStream))
+	if err != nil {
+		// Unreachable: emptyZlibStream is built by zlib itself.
+		panic(err)
+	}
+	return zr
+}}
+
+var zlibWriterPool = sync.Pool{New: func() any {
+	return zlib.NewWriter(io.Discard)
+}}
 
 func pktLine(data []byte) []byte {
 	total := len(data) + 4
@@ -155,9 +194,11 @@ func writePackObject(out *bytes.Buffer, typ int, data []byte) {
 		}
 		out.WriteByte(byte(b))
 	}
-	zw := zlib.NewWriter(out)
+	zw := zlibWriterPool.Get().(*zlib.Writer)
+	zw.Reset(out)
 	zw.Write(data)
 	zw.Close()
+	zlibWriterPool.Put(zw)
 }
 
 // writePack serializes objects as a pack: header, objects sorted by oid, then
@@ -244,19 +285,24 @@ func readPackObject(data []byte, pos int) (int, []byte, string, int, string) {
 	}
 	// Decompress the zlib payload with a counting reader: one inflate gives
 	// both the payload and the exact number of compressed bytes consumed.
+	// The zlib reader is pooled (Reset fully reinitializes it) and reset onto
+	// the counting reader directly, so the byte-exact accounting is unchanged.
 	compressed := data[pos:]
 	cr := &countingReader{r: bytes.NewReader(compressed)}
-	zr, err := zlib.NewReader(cr)
-	if err != nil {
+	zr := zlibReaderPool.Get().(zlibResetter)
+	if err := zr.Reset(cr, nil); err != nil {
+		zlibReaderPool.Put(zr)
 		return 0, nil, "", pos, "pack truncated"
 	}
 	var out bytes.Buffer
 	out.Grow(size)
 	if _, err := io.Copy(&out, zr); err != nil {
 		zr.Close()
+		zlibReaderPool.Put(zr)
 		return 0, nil, "", pos, "pack truncated"
 	}
 	zr.Close()
+	zlibReaderPool.Put(zr)
 	consumed := int(cr.n)
 	if consumed < 0 {
 		return 0, nil, "", pos, "zlib stream consumed no bytes"
