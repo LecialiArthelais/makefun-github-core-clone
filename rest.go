@@ -286,7 +286,7 @@ func unauthorizedResp() Response {
 // handleRest is the REST v3 handler. Returns (response, handled).
 func handleRest(store *Store, req *Request, segments []string) (Response, bool) {
 	method := req.Method
-	query := req.Query
+	query := req.QueryMap()
 
 	// GET /api/v3/ — root. No auth; X-OAuth-Scopes present.
 	if len(segments) == 0 {

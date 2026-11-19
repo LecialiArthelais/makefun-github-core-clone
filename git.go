@@ -881,7 +881,7 @@ func handleGit(store *Store, req *Request, segments []string) (Response, bool) {
 
 	// info/refs
 	if len(tail) == 2 && tail[0] == "info" && tail[1] == "refs" && req.Method == "GET" {
-		service := queryGet(req.Query, "service")
+		service := queryGet(req.QueryMap(), "service")
 		if service == "git-upload-pack" {
 			return bytesResponse(200, v2Advertisement, "application/x-git-upload-pack-advertisement"), true
 		}

@@ -176,13 +176,28 @@ func marshalJSON(v any) []byte {
 
 // Request is one parsed HTTP request as the handlers see it.
 type Request struct {
-	Method  string
-	Path    string // raw path (no query), split on '/'
-	Query   map[string][]string
-	Headers map[string]string // lowercased names -> values
-	Body    []byte
+	Method string
+	Path   string // raw path (no query), split on '/'
+	// RawQuery is the raw query string (no leading '?'). The parsed map is
+	// built lazily by QueryMap: most requests have no query at all, and
+	// building a map per request was pure overhead.
+	RawQuery string
+	Headers  map[string]string // lowercased names -> values
+	Body     []byte
 	// Oversized is set when the body exceeded the 64 MiB cap.
 	Oversized bool
+
+	queryParsed bool
+	query       map[string][]string
+}
+
+// QueryMap returns the parsed query map, building it on first use.
+func (r *Request) QueryMap() map[string][]string {
+	if !r.queryParsed {
+		r.query = parseQuery(r.RawQuery)
+		r.queryParsed = true
+	}
+	return r.query
 }
 
 // Response is one reply: a status, ordered headers, and a body.

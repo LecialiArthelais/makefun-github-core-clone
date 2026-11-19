@@ -596,8 +596,19 @@ func NewStore() *Store {
 func (s *Store) Lock()   { s.mu.Lock() }
 func (s *Store) Unlock() { s.mu.Unlock() }
 
+// lowerOrSame lowercases s, but returns s itself (no allocation) when it
+// contains no byte that lowercasing would change.
+func lowerOrSame(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' || s[i] >= 0x80 {
+			return strings.ToLower(s)
+		}
+	}
+	return s
+}
+
 func (s *Store) repoKey(owner, name string) string {
-	return strings.ToLower(owner) + "/" + strings.ToLower(name)
+	return lowerOrSame(owner) + "/" + lowerOrSame(name)
 }
 
 func (s *Store) GetRepo(owner, name string) *Repo {

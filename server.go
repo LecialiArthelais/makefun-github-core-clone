@@ -11,12 +11,14 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,23 +30,47 @@ const (
 
 // ------------------------------------------------------------------ Date header
 
-var dateCache struct {
-	mu   sync.Mutex
+// dateEntry is one cached Date header value. The whole entry is swapped
+// atomically, so readers never need a lock (the old mutex version showed up
+// in profiles as a per-request lock/unlock pair).
+type dateEntry struct {
 	sec  int64
 	text string
 }
+
+var dateCacheVal atomic.Value // dateEntry
 
 // dateHeader returns the current HTTP Date, cached per second.
 func dateHeader() string {
 	now := time.Now().UTC()
 	sec := now.Unix()
-	dateCache.mu.Lock()
-	defer dateCache.mu.Unlock()
-	if dateCache.sec != sec {
-		dateCache.sec = sec
-		dateCache.text = now.Format("Mon, 02 Jan 2006 15:04:05 GMT")
+	if e, ok := dateCacheVal.Load().(dateEntry); ok && e.sec == sec {
+		return e.text
 	}
-	return dateCache.text
+	e := dateEntry{sec: sec, text: now.Format("Mon, 02 Jan 2006 15:04:05 GMT")}
+	dateCacheVal.Store(e)
+	return e.text
+}
+
+var statusLines = map[int]string{
+	200: "HTTP/1.1 200 OK\r\n",
+	201: "HTTP/1.1 201 Created\r\n",
+	202: "HTTP/1.1 202 Accepted\r\n",
+	204: "HTTP/1.1 204 No Content\r\n",
+	400: "HTTP/1.1 400 Bad Request\r\n",
+	401: "HTTP/1.1 401 Unauthorized\r\n",
+	404: "HTTP/1.1 404 Not Found\r\n",
+	405: "HTTP/1.1 405 Method Not Allowed\r\n",
+	409: "HTTP/1.1 409 Conflict\r\n",
+	413: "HTTP/1.1 413 Content Too Large\r\n",
+	500: "HTTP/1.1 500 Internal Server Error\r\n",
+}
+
+func statusLine(status int) string {
+	if s, ok := statusLines[status]; ok {
+		return s
+	}
+	return "HTTP/1.1 " + itoa(status) + " " + reasonPhrase(status) + "\r\n"
 }
 
 func reasonPhrase(status int) string {
@@ -265,10 +291,12 @@ func (s *Server) removeConn(conn net.Conn) {
 }
 
 // writeResponse serializes one reply into a single buffer and writes it once.
+// Built with appends only (no string concatenation, no []byte(string)
+// conversions) on a pre-sized buffer.
 func writeResponse(conn net.Conn, resp Response, keepAlive bool) error {
 	isNoBody := resp.Status == 204 || resp.Status == 304
-	var buf []byte
-	buf = append(buf, []byte("HTTP/1.1 "+itoa(resp.Status)+" "+reasonPhrase(resp.Status)+"\r\n")...)
+	buf := make([]byte, 0, len(resp.Body)+256)
+	buf = append(buf, statusLine(resp.Status)...)
 	hasContentLength := false
 	for _, h := range resp.Headers {
 		if isNoBody && strings.EqualFold(h[0], "content-length") {
@@ -277,12 +305,19 @@ func writeResponse(conn net.Conn, resp Response, keepAlive bool) error {
 		if strings.EqualFold(h[0], "content-length") {
 			hasContentLength = true
 		}
-		buf = append(buf, h[0]+": "+h[1]+"\r\n"...)
+		buf = append(buf, h[0]...)
+		buf = append(buf, ": "...)
+		buf = append(buf, h[1]...)
+		buf = append(buf, "\r\n"...)
 	}
 	if !isNoBody && !hasContentLength {
-		buf = append(buf, "content-length: "+itoa(len(resp.Body))+"\r\n"...)
+		buf = append(buf, "content-length: "...)
+		buf = strconv.AppendInt(buf, int64(len(resp.Body)), 10)
+		buf = append(buf, "\r\n"...)
 	}
-	buf = append(buf, "date: "+dateHeader()+"\r\n"...)
+	buf = append(buf, "date: "...)
+	buf = append(buf, dateHeader()...)
+	buf = append(buf, "\r\n"...)
 	if keepAlive {
 		buf = append(buf, "connection: keep-alive\r\nkeep-alive: timeout=30\r\n"...)
 	} else {
@@ -342,19 +377,38 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		head := buf[:headEnd]
 
-		// Parse the request line + headers.
-		lines := strings.Split(string(head), "\r\n")
-		if len(lines) == 0 {
+		// Parse the request line + headers directly on the head bytes:
+		// no string(head) copy, no Split, no per-line allocations. Only the
+		// method/target strings and the header map entries allocate, and
+		// header names/values skip ToLower/TrimSpace when they are already
+		// in canonical form (the common case for the suite's client).
+		rlEnd := -1
+		for i := 0; i+1 < len(head); i++ {
+			if head[i] == '\r' && head[i+1] == '\n' {
+				rlEnd = i
+				break
+			}
+		}
+		if rlEnd < 0 {
 			writeSimple(conn, 400, "Bad Request", false)
 			return
 		}
-		parts := strings.SplitN(lines[0], " ", 3)
-		if len(parts) != 3 {
+		reqLine := head[:rlEnd]
+		sp1 := bytes.IndexByte(reqLine, ' ')
+		if sp1 <= 0 {
 			writeSimple(conn, 400, "Bad Request", false)
 			return
 		}
-		method, target, version := parts[0], parts[1], parts[2]
-		if version != "HTTP/1.0" && version != "HTTP/1.1" && version != "HTTP/2.0" {
+		sp2 := bytes.IndexByte(reqLine[sp1+1:], ' ')
+		if sp2 < 0 {
+			writeSimple(conn, 400, "Bad Request", false)
+			return
+		}
+		sp2 += sp1 + 1
+		method := string(reqLine[:sp1])
+		target := string(reqLine[sp1+1 : sp2])
+		version := reqLine[sp2+1:]
+		if !bytes.Equal(version, []byte("HTTP/1.0")) && !bytes.Equal(version, []byte("HTTP/1.1")) && !bytes.Equal(version, []byte("HTTP/2.0")) {
 			writeSimple(conn, 400, "Bad Request", false)
 			return
 		}
@@ -362,19 +416,35 @@ func (s *Server) handleConn(conn net.Conn) {
 			writeSimple(conn, 400, "Bad Request", false)
 			return
 		}
-		headers := map[string]string{}
+		headers := make(map[string]string, 8)
 		badHead := false
-		for _, line := range lines[1:] {
-			if line == "" {
+		pos := rlEnd + 2
+		for pos < len(head) {
+			eol := -1
+			for i := pos; i+1 < len(head); i++ {
+				if head[i] == '\r' && head[i+1] == '\n' {
+					eol = i
+					break
+				}
+			}
+			var line []byte
+			if eol < 0 {
+				line = head[pos:]
+				pos = len(head)
+			} else {
+				line = head[pos:eol]
+				pos = eol + 2
+			}
+			if len(line) == 0 {
 				continue
 			}
-			colon := strings.IndexByte(line, ':')
+			colon := bytes.IndexByte(line, ':')
 			if colon <= 0 {
 				badHead = true
 				break
 			}
-			name := strings.ToLower(strings.TrimSpace(line[:colon]))
-			value := strings.TrimSpace(line[colon+1:])
+			name := headerName(line[:colon])
+			value := headerValue(line[colon+1:])
 			if prev, ok := headers[name]; ok {
 				headers[name] = prev + ", " + value
 			} else {
@@ -388,7 +458,7 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		// Keep-alive: HTTP/1.1 defaults to keep-alive unless `connection: close`;
 		// HTTP/1.0 defaults to close unless `connection: keep-alive`.
-		keepAlive := version != "HTTP/1.0"
+		keepAlive := !bytes.Equal(version, []byte("HTTP/1.0"))
 		if connHdr, ok := headers["connection"]; ok {
 			lower := strings.ToLower(connHdr)
 			if strings.Contains(lower, "close") {
@@ -403,10 +473,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		// stays exact for pipelined requests.
 		path, query := splitTarget(target)
 		req := &Request{
-			Method:  method,
-			Path:    path,
-			Query:   parseQuery(query),
-			Headers: headers,
+			Method:   method,
+			Path:     path,
+			RawQuery: query,
+			Headers:  headers,
 		}
 		expectContinue := false
 		if expect, ok := headers["expect"]; ok && strings.EqualFold(strings.TrimSpace(expect), "100-continue") {
@@ -491,6 +561,38 @@ func (s *Server) handleConn(conn net.Conn) {
 		// Keep any pipelined bytes for the next request.
 		buf = append(buf[:0], buf[consumed:]...)
 	}
+}
+
+// headerName lowercases + trims a header name exactly like
+// strings.ToLower(strings.TrimSpace(string(b))) did, but without allocating
+// when the name is already lowercase ASCII with no surrounding spaces (the
+// common case). Any byte that could change the result (uppercase, non-ASCII,
+// surrounding space) falls back to the exact old expression.
+func headerName(b []byte) string {
+	for _, c := range b {
+		if c >= 'A' && c <= 'Z' || c >= 0x80 || isSpaceByte(c) {
+			return strings.ToLower(strings.TrimSpace(string(b)))
+		}
+	}
+	return string(b)
+}
+
+// isSpaceByte reports whether b is an ASCII whitespace byte that
+// strings.TrimSpace would trim at a string edge.
+func isSpaceByte(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\v' || b == '\f' || b == '\r'
+}
+
+// headerValue trims a header value exactly like strings.TrimSpace(string(b))
+// did, but without allocating when neither edge needs trimming.
+func headerValue(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if b[0] >= 0x80 || b[len(b)-1] >= 0x80 || isSpaceByte(b[0]) || isSpaceByte(b[len(b)-1]) {
+		return strings.TrimSpace(string(b))
+	}
+	return string(b)
 }
 
 // indexCRLFCRLF returns the index of the first "\r\n\r\n" in b, or -1.
