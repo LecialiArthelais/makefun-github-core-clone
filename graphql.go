@@ -1187,6 +1187,7 @@ func executeOperation(ctx *gqlCtx, op *gqlOperation) *orderedMap {
 					continue
 				}
 				node.issue.State = IssueClosed
+				node.issue.ver++
 				payload := newOrderedMap()
 				payload.set("issue", node)
 				data.set(key, executeSelection(ctx, &gqlVal{kind: "payload", payload: payload}, sel.field.selection))
@@ -1252,6 +1253,7 @@ func executeOperation(ctx *gqlCtx, op *gqlOperation) *orderedMap {
 				comment := Comment{ID: node.issue.NextCommentID, Body: gqlString(bodyV)}
 				node.issue.NextCommentID++
 				node.issue.Comments = append(node.issue.Comments, comment)
+				node.issue.ver++
 				commentValue := &gqlVal{kind: "comment", repo: node.repo, issue: node.issue, commentID: comment.ID, commentBody: comment.Body}
 				edge := &gqlVal{kind: "commentEdge", edgeNode: commentValue}
 				payload := newOrderedMap()

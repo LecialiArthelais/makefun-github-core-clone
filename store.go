@@ -63,6 +63,15 @@ type Issue struct {
 	Labels        []string
 	Comments      []Comment
 	NextCommentID int
+	// ver bumps on every mutation of this issue (PATCH, comment add, close).
+	// jsonBody is the memoized JSON response body for this issue (with the
+	// trailing newline jsonResponse appends), valid while jsonVer == ver and
+	// jsonLabelsVer == the repo's labelsVer. Same generation-keyed pattern
+	// as the git caches; a stale entry can never be served.
+	ver           int
+	jsonBody      []byte
+	jsonVer       int
+	jsonLabelsVer int
 }
 
 type PullFile struct {
@@ -111,6 +120,9 @@ type Repo struct {
 	Pulls     map[int]*Pull
 	NextIssue int
 	NextPull  int
+	// labelsVer bumps whenever a label is created; the memoized issue JSON
+	// keys on it (label colors feed into the issue body).
+	labelsVer int
 	// Creation order, for stable list ordering.
 	Seq int
 	// Bumped on every object/ref mutation; the git pack cache keys on it.

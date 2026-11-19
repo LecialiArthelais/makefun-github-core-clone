@@ -223,6 +223,18 @@ func jsonResponse(status int, v any, extra ...[2]string) Response {
 	return Response{Status: status, Headers: h, Body: text}
 }
 
+// jsonResponseBytes builds a JSON reply from already-serialized body bytes
+// (with trailing newline), exactly like jsonResponse but without re-marshaling.
+func jsonResponseBytes(status int, body []byte, extra ...[2]string) Response {
+	h := [][2]string{
+		{"content-type", jsonType},
+		{"content-length", itoa(len(body))},
+		{"x-github-request-id", nextRequestID()},
+	}
+	h = append(h, extra...)
+	return Response{Status: status, Headers: h, Body: body}
+}
+
 // jsonError is a {"message": ...} JSON reply.
 func jsonError(status int, message string) Response {
 	return jsonResponse(status, map[string]string{"message": message})
