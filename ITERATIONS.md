@@ -68,8 +68,48 @@ Cek gofmt: `gofmt -l .` (bukan `go fmt -l`).
   menumpuk dengan paket HTTP/REST agen lain. Writer pooling mempercepat
   fetch-miss/conformance (untimed).
 - `gofmt -l` bersih, `go vet` PASS, binary 3.657.912 byte (≤8 MiB ✓).
-- Status: COMMITTED (lihat git log), grade-local ×3 MENUNGGU (load mesin
-  ~3–4 saat implementasi; jalankan saat load memungkinkan).
+- Status: COMMITTED (`6ec859e`), grade-local ×3 + A/B ×3 SELESAI (lihat bawah).
+  Binary reproducible byte-identik (rebuild ke /tmp + `cmp` PASS).
+
+## Hasil grade-local iterasi 1 (kit yang sama, grade.sh)
+
+Kandidat ×3 (`grade-local-verify/pack-pool-run1/2/3`):
+- run1: 935 (perf 135, p50 498.926 µs) — push 444,7/49 · clone 263,4/25 ·
+  read 2437,4/27 · write 217,0/34
+- run2: 958 (perf 158, p50 360.057 µs) — push 426,8/49 · clone 214,9/29 ·
+  read 1101,6/42 · write 166,3/38
+- run3: 914 (perf 114, p50 675.431 µs) — push 855,1/37 · clone 472,2/15 ·
+  read 2382,2/28 · write 216,4/34
+- Median kandidat (batch ini): **935**. Semua run: 120/120, state `a0e98d49…`,
+  nondeterministic 0.
+
+A/B interleave vs baseline `go-port-worktree` e37d515 (pasangan berurutan,
+jendela beban sama; `ab-base-N` vs `ab-pack-N`):
+- Pair 1 (load ~1,35): base 957 (358.573 µs) vs pack 965 (329.681 µs) → +8
+- Pair 2 (load melonjak 4,29 di tengah): base 948 (416.452 µs) vs pack 934
+  (502.001 µs) → −14 (kandidat jalan saat spike — ter-confound)
+- Pair 3 (load 4,47): base 946 (421.651 µs) vs pack 961 (345.427 µs) → +15
+- Median A/B: base **948** vs pack **961** → +13. TAPI split per-workload
+  A/B: push base 453,0/48 vs pack 537,9/45 (−3); clone 186,3/31 vs 193,9/31
+  (0); read 1289,6/39 vs 1160,0/41 (+2); write 185,6/36 vs 137,0/42 (+6).
+  **+13 itu berasal dari read/write — workload yang pooling TIDAK BISA
+  sentuh — sementara push (satu-satunya yang bisa) −3.** Itu sidik jari
+  noise/drift kondisi mesin, bukan efek kode.
+- Semua 6 run kandidat vs 6 run baseline (verify + A/B): median total
+  kandidat 946,5 vs baseline 951 — dalam noise (< ~10 pt bukan bukti).
+  Push median 6-run: kandidat 491,5 ms vs baseline 526,5 ms (lemah positif,
+  dalam noise). Clone median 6-run: kandidat ~229 ms vs baseline ~187 ms —
+  clone tidak tersentuh pooling (cache-hit, client-bound); selisih ini noise.
+- **Verdict: pooling TIDAK TERBUKTI menambah skor grade-local (efeknya di
+  bawah noise, sesuai prediksi ~+0,3 pt), dan TIDAK TERBUKTI merugikan
+  (120/120 + state identik + nondet 0 di semua 6 run; tidak ada workload yang
+  memburuk secara konsisten di luar noise).** Dipertahankan karena:
+  pengurangan CPU pack-path terukur kuat di benchmark terisolasi (7× inflate,
+  20× deflate; readPack 600 objek 15,1 ms → 1,57 ms), output byte-identik,
+  risiko nol yang terdemonstrasi — dan karena beban alokasi/GC yang hilang
+  membantu di host produksi yang ketat memorinya, yang tidak bisa diukur di
+  sini. Bila parent butuh klaim skor, klaim yang jujur adalah "netral,
+  tidak terbukti ±", bukan "+13".
 
 ## Iterasi berikutnya (kandidat, belum dikerjakan)
 
