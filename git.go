@@ -103,8 +103,12 @@ func cachedFetch(repo *Repo, req fetchRequest, build func() ([]byte, []string)) 
 // `name=oid` pair, sorted. It covers everything listRefs()/wanted-refs depend
 // on — a tag's peeled target is a pure function of the tag object's content,
 // which its oid already fixes. Used as a cache key so a ref mutation can never
-// serve a stale cached advertisement/ls-refs/fetch response.
+// serve a stale cached advertisement/ls-refs/fetch response. Memoized per
+// Generation (which bumps on every refs mutation).
 func refsFingerprint(repo *Repo) string {
+	if repo.fpGen == repo.Generation {
+		return repo.fp
+	}
 	names := make([]string, 0, len(repo.Refs))
 	for name := range repo.Refs {
 		names = append(names, name)
@@ -114,16 +118,24 @@ func refsFingerprint(repo *Repo) string {
 	for _, name := range names {
 		parts = append(parts, name+"="+repo.Refs[name])
 	}
-	return strings.Join(parts, "\n")
+	repo.fp = strings.Join(parts, "\n")
+	repo.fpGen = repo.Generation
+	return repo.fp
 }
 
-// sortedRefNames returns the repo's ref names, sorted.
+// sortedRefNames returns the repo's ref names, sorted. Memoized per
+// Generation; callers only read the returned slice, never mutate it.
 func sortedRefNames(repo *Repo) []string {
+	if repo.sortedNamesGen == repo.Generation {
+		return repo.sortedNames
+	}
 	names := make([]string, 0, len(repo.Refs))
 	for name := range repo.Refs {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	repo.sortedNames = names
+	repo.sortedNamesGen = repo.Generation
 	return names
 }
 
@@ -200,8 +212,19 @@ var v2Advertisement = func() []byte {
 }()
 
 // v0Advertisement is the v0 advertisement body for git-receive-pack. Only the
-// tip oid varies per repo state.
+// tip oid varies per repo state. Memoized per Generation: the bytes are a pure
+// function of the refs (+ DefaultBranch, fixed at creation).
 func v0Advertisement(repo *Repo) []byte {
+	if repo.v0AdvGen == repo.Generation {
+		return repo.v0Adv
+	}
+	adv := buildV0Advertisement(repo)
+	repo.v0Adv = adv
+	repo.v0AdvGen = repo.Generation
+	return adv
+}
+
+func buildV0Advertisement(repo *Repo) []byte {
 	caps := "symref=HEAD:refs/heads/" + repo.DefaultBranch + " report-status side-band-64k delete-refs ofs-delta object-format=sha1 agent=" + agentName
 	refs := listRefs(repo)
 	var sb strings.Builder

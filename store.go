@@ -131,6 +131,15 @@ type Repo struct {
 	packCache map[string]*fetchCacheEntry
 	lsCache   map[string][]byte
 	respCache map[string]*respCacheEntry
+	// Memoized refs-derived bytes, keyed by Generation (which already bumps
+	// on every refs mutation — the same invalidation signal the git caches
+	// rely on). -1 = not built yet.
+	v0Adv          []byte
+	v0AdvGen       int
+	fp             string
+	fpGen          int
+	sortedNames    []string
+	sortedNamesGen int
 }
 
 type fetchCacheEntry struct {
@@ -639,23 +648,26 @@ func (s *Store) CreateRepo(name, description string, isPrivate bool) *Repo {
 		return nil
 	}
 	repo := &Repo{
-		DatabaseID:    s.nextDatabaseID,
-		Name:          name,
-		Owner:         ViewerLogin,
-		Description:   description,
-		Private:       isPrivate,
-		DefaultBranch: DefaultBranch,
-		Refs:          map[string]string{},
-		Objects:       map[string]GitObject{},
-		Labels:        map[string]Label{},
-		Issues:        map[int]*Issue{},
-		Pulls:         map[int]*Pull{},
-		NextIssue:     1,
-		NextPull:      1,
-		Seq:           s.nextSeq,
-		packCache:     map[string]*fetchCacheEntry{},
-		lsCache:       map[string][]byte{},
-		respCache:     map[string]*respCacheEntry{},
+		DatabaseID:     s.nextDatabaseID,
+		Name:           name,
+		Owner:          ViewerLogin,
+		Description:    description,
+		Private:        isPrivate,
+		DefaultBranch:  DefaultBranch,
+		Refs:           map[string]string{},
+		Objects:        map[string]GitObject{},
+		Labels:         map[string]Label{},
+		Issues:         map[int]*Issue{},
+		Pulls:          map[int]*Pull{},
+		NextIssue:      1,
+		NextPull:       1,
+		Seq:            s.nextSeq,
+		packCache:      map[string]*fetchCacheEntry{},
+		lsCache:        map[string][]byte{},
+		respCache:      map[string]*respCacheEntry{},
+		v0AdvGen:       -1,
+		fpGen:          -1,
+		sortedNamesGen: -1,
 	}
 	s.nextDatabaseID++
 	s.nextSeq++
